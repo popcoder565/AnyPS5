@@ -117,6 +117,40 @@ void CheckOwnStore() {
     CollectWritesUncached(base, 2 * Block);
     Require(!UnchangedSince(base, 64, beforeCpu), "a CPU write after the driver store is not seen");
 }
+
+#ifdef _WIN32
+void CheckImportPinMarking() {
+    void* memory = AllocateWatched(2 * Block);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    auto* bytes = static_cast<volatile std::uint8_t*>(memory);
+    std::memset(memory, 0x11, 2 * Block);
+    CollectWritesUncached(base, 2 * Block);
+    Require(ImportWatched(base, 2 * Block, [] { return true; }), "the import callback did not run");
+    const auto markEveryPage = [&](std::uint8_t value) {
+        for (std::size_t offset = 0; offset < 2 * Block; offset += 4096) bytes[offset] = value;
+    };
+    std::array<std::uint64_t, 2> generations{};
+    std::array<std::uint8_t, 2> changed{};
+
+    const auto beforePartial = CollectWritesUncached(base, 2 * Block);
+    bytes[8] = 0x22;
+    CollectWritesUncached(base, 2 * Block);
+    generations.fill(beforePartial);
+    Require(ChangedBlocks(base, 2 * Block, generations, changed) && changed[0] == BlockWritten && changed[1] == BlockUnchanged, "a CPU store to one page of a fresh import is not taken as written");
+
+    const auto beforePin = TrackerGeneration();
+    markEveryPage(0x11);
+    CollectWritesUncached(base, 2 * Block);
+    generations.fill(beforePin);
+    Require(ChangedBlocks(base, 2 * Block, generations, changed) && changed[0] == BlockMaybeWritten && changed[1] == BlockMaybeWritten, "every page of a fresh import marked written after its window is taken as a CPU store");
+
+    const auto afterPin = TrackerGeneration();
+    markEveryPage(0x33);
+    CollectWritesUncached(base, 2 * Block);
+    generations.fill(afterPin);
+    Require(ChangedBlocks(base, 2 * Block, generations, changed) && changed[0] == BlockWritten && changed[1] == BlockWritten, "a CPU store to every page of an import whose pages were already marked is not taken as written");
+}
+#endif
 }
 
 int main() {
@@ -127,6 +161,9 @@ int main() {
         }
         CheckSharedBlock();
         CheckOwnStore();
+#ifdef _WIN32
+        CheckImportPinMarking();
+#endif
     } catch (const std::exception& error) {
         std::cerr << "write tracking test failed: " << error.what() << "\n";
         return 1;

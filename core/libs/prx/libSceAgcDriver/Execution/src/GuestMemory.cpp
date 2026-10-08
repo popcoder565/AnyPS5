@@ -684,6 +684,7 @@ struct WriteTracker {
     // records in the same block (the title's per-job slots are 0x20 apart) must not count.
     std::vector<std::uint32_t> cpuBlocks;
     std::vector<std::uint32_t> writtenBlocks;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pendingPins;
 #else
     static constexpr std::size_t LeafBlocks = std::size_t{1} << 16;
     static constexpr std::size_t LeafCount = std::size_t{1} << 15;
@@ -899,9 +900,59 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 }
 #endif
 
+#ifdef _WIN32
+constexpr std::size_t MaxPendingPins = 256;
+
+std::uint64_t writtenPages(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
+    constexpr std::uint64_t page = 4096;
+    std::uint64_t written = 0;
+    for (auto cursor = first; cursor < stop;) {
+        std::size_t count = tracker.pages.size();
+        if (!GuestArena::GuestArenaCollectWrites_nid_postfix(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, false)) return 0;
+        written += count;
+        if (count < tracker.pages.size()) break;
+        cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + page;
+    }
+    return written;
+}
+
+bool everyPageWritten(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
+    constexpr std::uint64_t page = 4096;
+    const auto total = (stop - first) / page;
+    auto written = writtenPages(tracker, first, stop);
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(4);
+    while (written != 0 && written < total && std::chrono::steady_clock::now() < deadline) {
+        SwitchToThread();
+        written = writtenPages(tracker, first, stop);
+    }
+    return written == total;
+}
+
+void settlePins(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
+    constexpr std::uint64_t page = 4096;
+    auto& pins = tracker.pendingPins;
+    for (auto pin = pins.begin(); pin != pins.end();) {
+        const auto [pinFirst, pinStop] = *pin;
+        if (pinStop <= first || stop <= pinFirst || !everyPageWritten(tracker, pinFirst, pinStop)) {
+            ++pin;
+            continue;
+        }
+        for (auto cursor = pinFirst; cursor < pinStop;) {
+            std::size_t count = tracker.pages.size();
+            if (!GuestArena::GuestArenaCollectWrites_nid_postfix(cursor, static_cast<std::size_t>(pinStop - cursor), tracker.pages.data(), &count, true)) break;
+            for (std::size_t i = 0; i < count; ++i) tracker.stamp(tracker.blockOf(reinterpret_cast<std::uintptr_t>(tracker.pages[i])), tracker.generation, StampKind::ImportWindow);
+            if (count < tracker.pages.size()) break;
+            cursor = reinterpret_cast<std::uintptr_t>(tracker.pages[count - 1]) + page;
+        }
+        pin = pins.erase(pin);
+    }
+}
+#endif
+
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind) {
     ++tracker.generation;
 #ifdef _WIN32
+    if (!tracker.pendingPins.empty()) settlePins(tracker, first, stop);
     constexpr std::uint64_t page = 4096;
     // One resetting walk: the kernel reports and clears a page's dirty bit together, a write landing
     // after the walk passed a page is reported by the next walk, and a clean page is not touched by the
@@ -1049,6 +1100,12 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu);
     if (!import()) return false;
     if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+#ifdef _WIN32
+    else if (std::find(tracker.pendingPins.begin(), tracker.pendingPins.end(), std::pair{first, stop}) == tracker.pendingPins.end()) {
+        if (tracker.pendingPins.size() == MaxPendingPins) tracker.pendingPins.erase(tracker.pendingPins.begin());
+        tracker.pendingPins.emplace_back(first, stop);
+    }
+#endif
     return true;
 }
 
